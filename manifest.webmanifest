@@ -1,0 +1,2 @@
+{"name":"La Plata","short_name":"La Plata","description":"Tus finanzas, claras y en un solo sitio.","start_url":"./","scope":"./","display":"standalone","background_color":"#F7F9FD","theme_color":"#3B7BF6",
+ "icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png"},{"src":"icon-512.png","sizes":"512x512","type":"image/png"},{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
