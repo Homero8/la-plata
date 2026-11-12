@@ -1,0 +1,6 @@
+node_modules/
+tests/shots/
+*.json.bak
+plata*.json
+*.csv
+.DS_Store
