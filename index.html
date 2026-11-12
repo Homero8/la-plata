@@ -103,8 +103,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{ou
 .prow.done .dday{background:var(--green-soft);color:var(--green)}
 .prow.done .dday small{color:var(--green)}
 .paybtn{border:1px solid var(--blue);background:var(--blue-soft);color:var(--blue);border-radius:9px;padding:6px 11px;font-weight:600;font-size:12.5px}
-body.ro .paybtn{display:none}
-@media(max-width:520px){.prow{grid-template-columns:42px minmax(0,1fr) auto;row-gap:4px}.prow .ai{display:none}.prow .paybtn{grid-column:2/4;justify-self:start}}
+body.ro .payWrap{display:none}
+@media(max-width:520px){.prow{grid-template-columns:42px minmax(0,1fr) auto;row-gap:4px}.prow .ai{display:none}.prow .payWrap{grid-column:2/4;justify-self:start}}
 .pgsum{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin:2px 0 8px}
 .pgsum b{color:var(--ink)}
 .progrow{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
@@ -444,10 +444,19 @@ const DSEM=["dom","lun","mar","mié","jue","vie","sáb"];
 function dueOf(p,m){const[y,mm]=m.split("-").map(Number);const d=Math.min(+p.dia||1,daysIn(m));let dt=new Date(y,mm-1,d);
   if(p.habil){while(dt.getDay()===0||dt.getDay()===6)dt.setDate(dt.getDate()+1)}
   return`${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`}
-function progsFor(m){const out=[];
-  (S.config?.programados||[]).forEach(p=>{if(p.desde&&p.desde>m)return;if(p.hasta&&p.hasta<m)return;if(p.meses&&p.meses.length&&!p.meses.includes(+m.slice(5)))return;out.push(Object.assign({},p,{fecha:dueOf(p,m)}))});
-  (S.config?.botes||[]).forEach(b=>{const v=planEn(b.plan,m);if(v>0)out.push({id:"bote-"+b.id,nombre:"Ahorro · "+b.nombre,tipo:"aporte",bote:b.id,cuenta:b.cuenta||"",importe:v,dia:1,fecha:dueOf({dia:1},m),auto:true})});
+/* over[mes]: "omitido" | "pagado_antes" | {aplaza:"YYYY-MM-DD"} — estado de una mensualidad, sin tocar otros meses */
+function progsFor(m){const out=[],omit=ov=>ov==="omitido"||ov==="pagado_antes"||(ov&&ov.aplaza);
+  (S.config?.programados||[]).forEach(p=>{
+    if(!(p.desde&&p.desde>m)&&!(p.hasta&&p.hasta<m)&&!(p.meses&&p.meses.length&&!p.meses.includes(+m.slice(5)))){
+      const ov=p.over&&p.over[m];if(!omit(ov))out.push(Object.assign({},p,{fecha:dueOf(p,m)}))}
+    if(p.over)for(const om in p.over){const ov=p.over[om];if(ov&&ov.aplaza&&ov.aplaza.slice(0,7)===m)out.push(Object.assign({},p,{fecha:ov.aplaza,id:p.id+"@"+om,aplazadoDe:om}))}});
+  (S.config?.botes||[]).forEach(b=>{const ov=b.over&&b.over[m],v=planEn(b.plan,m);
+    if(v>0&&!omit(ov))out.push({id:"bote-"+b.id,nombre:"Ahorro · "+b.nombre,tipo:"aporte",bote:b.id,cuenta:b.cuenta||"",importe:v,dia:1,fecha:dueOf({dia:1},m),auto:true});
+    if(b.over)for(const om in b.over){const o=b.over[om];if(o&&o.aplaza&&o.aplaza.slice(0,7)===m){const v2=planEn(b.plan,om);if(v2>0)out.push({id:"bote-"+b.id+"@"+om,nombre:"Ahorro · "+b.nombre,tipo:"aporte",bote:b.id,cuenta:b.cuenta||"",importe:v2,dia:1,fecha:o.aplaza,auto:true,aplazadoDe:om})}}});
   return out.sort((a,b)=>a.fecha.localeCompare(b.fecha)||a.nombre.localeCompare(b.nombre))}
+async function setOver(kind,ownerId,m,val){const n=cloneCfg();const list=kind==="bote"?n.botes:n.programados;
+  const t=(list||[]).find(x=>x.id===ownerId);if(!t)throw new Error("not-found");
+  t.over=t.over||{};if(val==null)delete t.over[m];else t.over[m]=val;await saveConfig(n)}
 function sameKey(p,x){if(p.tipo!==x.tipo)return false;if(p.tipo==="gasto"||p.tipo==="ingreso")return p.cat===x.cat&&p.sub===x.sub;if(p.tipo==="aporte")return p.bote===x.bote;if(p.tipo==="pago")return p.deuda===x.deuda;return false}
 function statusFor(m){const ms=inMonth(m).slice().sort((a,b)=>(a.fecha||"").localeCompare(b.fecha||""));const used=new Set();
   return progsFor(m).map(p=>{const x=ms.find(x=>!used.has(x)&&sameKey(p,x));if(x)used.add(x);return{p,mov:x||null}})}
@@ -478,11 +487,23 @@ function paySelect(id,sel,o){o=o||{};return`<select id="${id}">${accs().map(a=>`
 const lastPay=()=>{let v="";try{v=localStorage.getItem("plata_lastPay")||""}catch(e){}return v.startsWith("a:")&&accs().some(a=>"a:"+a.id===v)?v:"a:"+(S.config.cuentaGasto||baseAcc())};
 const _bal={};
 const today=()=>S.asOf||todayStr,curM=()=>today().slice(0,7);
+/* a qué cuenta mueve cada pago pendiente (programado todavía sin movimiento) */
+function pendAccDelta(items){const acc={},add=(id,v)=>{acc[id]=(acc[id]||0)+v};let cf=0;
+  items.forEach(({p})=>{const a=+p.importe||0,c=p.cuenta&&accs().some(q=>q.id===p.cuenta)?p.cuenta:null;
+    if(p.tipo==="ingreso"){if(p.cat==="in-alimentacion")cf+=a;else add(c||baseAcc(),a)}
+    else if(p.tipo==="gasto"){if(p.cat==="alimentacion"&&cfOn()&&!c)cf-=a;else add(c||S.config.cuentaGasto||baseAcc(),-a)}
+    else if(p.tipo==="pago")add(c||baseAcc(),-a);
+    else if(p.tipo==="aporte")add(c||(bote(p.bote)?.cuenta)||baseAcc(),-a)});
+  return{acc,cf}}
 function balance(m){const cur=curM();const key=m+"|"+S.movs.length+"|"+(S.config?.programados||[]).length+"|"+(S.asOf||"");if(_bal[key])return _bal[key];
   const st=statusFor(m),pend=st.filter(i=>!i.mov),fl=flowsOf(pend);let r;
-  if(m<cur){const l=ledger(m);r={cuenta:l.acct,cf:l.cf,acc:l.acc,libre:l.acct,cfLibre:l.cf,pend,st,fl,kind:"past"}}
-  else if(m===cur){const l=ledger(m);r={cuenta:l.acct,cf:l.cf,acc:l.acc,libre:l.acct+fl.inA-fl.out,cfLibre:l.cf+fl.inCF,pend,st,fl,kind:"cur"}}
-  else{const pv=balance(addM(m,-1)),n=netActual(m);const cuenta=pv.libre+n.acct,cf=Math.max(0,pv.cfLibre+n.cf);r={cuenta,cf,libre:cuenta+fl.inA-fl.out,cfLibre:cf+fl.inCF,pend,st,fl,kind:"fut"}}
+  if(m<cur){const l=ledger(m);r={cuenta:l.acct,cf:l.cf,acc:l.acc,accLibre:l.acc,libre:l.acct,cfLibre:l.cf,pend,st,fl,kind:"past"}}
+  else if(m===cur){const l=ledger(m);const pd=pendAccDelta(pend),accLibre=Object.assign({},l.acc);for(const i in pd.acc)accLibre[i]=(accLibre[i]||0)+pd.acc[i];
+    r={cuenta:l.acct,cf:l.cf,acc:l.acc,accLibre,libre:l.acct+fl.inA-fl.out,cfLibre:l.cf+fl.inCF,pend,st,fl,kind:"cur"}}
+  else{const pv=balance(addM(m,-1)),n=netActual(m);const cuenta=pv.libre+n.acct,cf=Math.max(0,pv.cfLibre+n.cf);
+    const acc=Object.assign({},pv.accLibre);for(const i in n.acc)acc[i]=(acc[i]||0)+n.acc[i];
+    const pd=pendAccDelta(pend),accLibre=Object.assign({},acc);for(const i in pd.acc)accLibre[i]=(accLibre[i]||0)+pd.acc[i];
+    r={cuenta,cf,acc,accLibre,libre:cuenta+fl.inA-fl.out,cfLibre:cf+fl.inCF,pend,st,fl,kind:"fut"}}
   return _bal[key]=r}
 function boteSaldo(b){let s=+b.inicial||0;S.movs.forEach(x=>{const a=+x.importe||0;if(x.tipo==="aporte"&&x.bote===b.id)s+=a;if(x.tipo==="retiro"&&x.bote===b.id)s-=a;if(x.tipo==="gasto"&&x.desdeBote===b.id)s-=a;if(x.tipo==="prestamo"&&x.bote===b.id)s-=a;if(x.tipo==="cobro"&&x.bote===b.id)s+=a});return s}
 /* préstamos que hiciste (me deben) */
@@ -542,7 +563,7 @@ function rInicio(){
 }
 function rAccList(B){const t=$("#accTog"),l=$("#accList");const ok=!!S.config.cuentas&&B.acc&&accs().length>1;t.hidden=!ok;
   let open=false;try{open=localStorage.getItem("plata_accOpen")==="1"}catch(e){}t.setAttribute("aria-expanded",ok&&open?"true":"false");l.hidden=!(ok&&open);
-  if(ok)l.innerHTML=accs().map(a=>`<div><span><i style="background:${a.color||"var(--blue)"}"></i>${esc(a.nombre)}</span><b class="num">${eur(B.acc[a.id]||0)}</b></div>`).join("");
+  if(ok)l.innerHTML=(B.kind==="fut"?`<div style="font-size:11.5px;color:var(--faint);margin-bottom:4px">Estimación, si pagas todo lo previsto</div>`:"")+accs().map(a=>`<div><span><i style="background:${a.color||"var(--blue)"}"></i>${esc(a.nombre)}</span><b class="num">${eur(B.acc[a.id]||0)}</b></div>`).join("");
   $("#cuadreBar").hidden=!(canWrite&&S.config.pendCuadre&&S.view==="inicio"&&!S.asOf)}
 $("#accTog").onclick=()=>{const v=$("#accTog").getAttribute("aria-expanded")!=="true";try{localStorage.setItem("plata_accOpen",v?"1":"0")}catch(e){}render()};
 $("#cuadreGo").onclick=()=>cuadre();
@@ -558,14 +579,16 @@ function rPagos(B){
   const today_=today();
   el.innerHTML=list.map(({p,mov})=>{const l=label(Object.assign({},p,{tipo:p.tipo}));const f=mov?mov.fecha:p.fecha;const dt=new Date(+f.slice(0,4),+f.slice(5,7)-1,+f.slice(8));
     let sb=esc(l.cat)+(l.sub?" · "+esc(l.sub):"")+(S.config.cuentas&&p.cuenta?` · <span style="color:var(--blue)">${esc(accName(p.cuenta))}</span>`:"");
+    if(p.aplazadoDe)sb+=` · <span style="color:var(--amber)">aplazado desde ${esc(mLabel(p.aplazadoDe))}</span>`;
     if(!mov){const lim=p.vence?`${p.fecha.slice(0,8)}${String(Math.min(p.vence,daysIn(S.month))).padStart(2,"0")}`:p.fecha;
-      if(B.kind==="cur"&&lim<today_)sb=`<span class="sb late">${p.tipo==="ingreso"?"no registrado":"venció el "+(+lim.slice(8))}</span>`;else if(B.kind==="past")sb=`<span class="sb late">sin registrar</span>`;else if(p.vence)sb+=` · vence el ${Math.min(p.vence,daysIn(S.month))}`;else if(p.nota)sb+=" · "+esc(p.nota)}
+      if(B.kind==="cur"&&lim<today_&&!p.aplazadoDe)sb=`<span class="sb late">${p.tipo==="ingreso"?"no registrado":"venció el "+(+lim.slice(8))}</span>`;else if(B.kind==="past")sb=`<span class="sb late">sin registrar</span>`;else if(p.vence)sb+=` · vence el ${Math.min(p.vence,daysIn(S.month))}`;else if(p.nota)sb+=" · "+esc(p.nota)}
     else{const d=(+mov.importe||0)-(+p.importe||0);if(Math.abs(d)>0.004)sb+=` · previsto ${eur(+p.importe||0)}`}
     const amt=mov?+mov.importe||0:+p.importe||0,pos=p.tipo==="ingreso";
     return`<div class="prow${mov?" done":""}"><div class="dday"><b>${dt.getDate()}</b><small>${mov?"✓ ":""}${DSEM[dt.getDay()]}</small></div><div class="ai" style="background:${l.col}1f;color:${l.col}"><span class="ms">${esc(l.ic)}</span></div>
      <div style="min-width:0"><div class="nm">${esc(p.nombre)}</div><div class="sb">${sb}</div></div><span class="amt num ${pos?"pos":""}">${pos?"+":"−"} ${eur(amt)}</span>
-     ${mov?`<span></span>`:`<button class="paybtn" data-pay="${esc(p.id)}">${pos?"Cobrar":p.tipo==="aporte"?"Guardar":"Pagar"}</button>`}</div>`}).join("");
-  el.querySelectorAll("[data-pay]").forEach(b=>b.onclick=()=>{const it=pend.find(i=>i.p.id===b.dataset.pay);if(it)openAdd(it.p)});
+     ${mov?`<span></span>`:`<div class="payWrap" style="display:flex;gap:4px;align-items:center"><button class="paybtn" data-pay="${esc(p.id)}">${pos?"Cobrar":p.tipo==="aporte"?"Guardar":"Pagar"}</button><button class="ib" data-more="${esc(p.id)}" aria-label="Más opciones" style="width:28px;height:28px;flex:none"><span class="ms" style="font-size:18px">more_vert</span></button></div>`}</div>`}).join("");
+  el.querySelectorAll("[data-pay]").forEach(b=>b.onclick=()=>{const it=pend.find(i=>i.p.id===b.dataset.pay);if(it)quickPay(it.p,b)});
+  el.querySelectorAll("[data-more]").forEach(b=>b.onclick=()=>{const it=pend.find(i=>i.p.id===b.dataset.more);if(it)progMenu(it.p)});
 }
 function lineChart(el,pts,opts){
   const W=Math.max(300,el.clientWidth||600),H=opts.h||240,L=48,R=14,T=24,B=28;
@@ -774,7 +797,7 @@ function editDebo(o){const d=o?o.d:Object.assign({id:"",persona:"",importe:"",co
    <div class="err" id="dbE"></div><div style="display:flex;gap:8px;flex-wrap:wrap">${o?`<button class="btn danger" id="dbDel">Eliminar</button>`:""}<button class="btn pri" id="dbOk" style="flex:1;justify-content:center;padding:12px">Guardar</button></div>`);
   $("#dbX").onclick=closeSheet;bindCatSelects("db");$$("[data-dbp]").forEach(b=>b.onclick=()=>$("#dbP").value=b.dataset.dbp);
   if(o)$("#dbDel").onclick=async()=>{const n=cloneCfg();n.debo=(n.debo||[]).filter(x=>x.id!==d.id);try{await saveConfig(n);closeSheet();toast("Eliminado")}catch(e){$("#dbE").textContent="No se pudo eliminar."}};
-  $("#dbOk").onclick=async()=>{const per=$("#dbP").value.trim(),a=parseFloat($("#dbA").value.replace(",",".")),E=$("#dbE");
+  $("#dbOk").onclick=async()=>{const per=$("#dbP").value.trim(),a=toNum($("#dbA").value),E=$("#dbE");
     if(!per)return E.textContent="Escribe a quién le debes.";if(!(a>0))return E.textContent="Pon un importe mayor que 0.";if(!$("#dbF").value)return E.textContent="Elige la fecha.";
     const n=cloneCfg();n.debo=n.debo||[];const rec={id:d.id||("db"+Date.now().toString(36)),persona:per,importe:Math.round(a*100)/100,concepto:$("#dbK").value.trim(),fecha:$("#dbF").value,cat:$("#dbC").value,sub:$("#dbS").value};
     const i=n.debo.findIndex(x=>x.id===rec.id);if(i>=0)n.debo[i]=rec;else n.debo.push(rec);
@@ -789,7 +812,7 @@ function payDebo(o){if(!o)return;const d=o.d;
    <p style="color:var(--muted);font-size:13px;margin:10px 0 0">Se registra como un gasto en esa categoría, porque al final fue algo tuyo.</p>
    <div class="err" id="pdE"></div><button class="btn pri" id="pdOk" style="width:100%;justify-content:center;padding:12px;margin-top:8px">Registrar pago</button>`);
   $("#pdX").onclick=closeSheet;bindCatSelects("pd");
-  $("#pdOk").onclick=async()=>{const a=parseFloat($("#pdA").value.replace(",",".")),E=$("#pdE"),from=$("#pdFrom").value;
+  $("#pdOk").onclick=async()=>{const a=toNum($("#pdA").value),E=$("#pdE"),from=$("#pdFrom").value;
     if(!(a>0))return E.textContent="Pon un importe mayor que 0.";if(a>o.falta+0.004)return E.textContent=`Solo le debes ${eur(o.falta)}.`;if(!$("#pdF").value)return E.textContent="Elige la fecha.";
     const b=from.startsWith("b:")?bote(from.slice(2)):null;if(b&&boteSaldo(b)<a-0.004)return E.textContent=`En ${b.nombre} solo hay ${eur(boteSaldo(b))}.`;
     const doc={tipo:"gasto",cat:$("#pdC").value,sub:$("#pdS").value,ref:d.id,importe:Math.round(a*100)/100,fecha:$("#pdF").value,desc:(d.concepto?d.concepto+" · ":"")+"pago a "+d.persona,creado:new Date().toISOString()};payDec(from,doc);
@@ -800,16 +823,20 @@ const pendDel=new Set();
 function rNotas(){const list=(S.notas||[]).slice().sort((a,b)=>String(b.creado).localeCompare(String(a.creado)));const el=$("#nList");
   el.innerHTML=list.length?list.map(n=>`<label class="nrow${pendDel.has(n.id)?" gone":""}"><input type="checkbox" data-nid="${esc(n.id)}"${pendDel.has(n.id)?" checked":""} aria-label="Hecha"><span class="tx">${esc(n.texto)}<small>${n.creado?new Date(n.creado).toLocaleDateString("es-ES",{day:"numeric",month:"short"}):""}</small></span></label>`).join("")
     :`<div class="empty">Sin notas pendientes.</div>`;
-  el.querySelectorAll("[data-nid]").forEach(c=>c.onchange=()=>{if(c.checked)doneNote(c.dataset.nid);else undoNote()});
+  el.querySelectorAll("[data-nid]").forEach(c=>c.onchange=()=>{if(c.checked)doneNote(c.dataset.nid);else undoNow()});
 }
 function setNotaBadge(){const n=(S.notas||[]).filter(x=>!pendDel.has(x.id)).length;$("#notasN").textContent=n?n:""}
-let undoT=null,undoId=null;
-function doneNote(id){if(undoId&&undoId!==id)commitDel();undoId=id;pendDel.add(id);rNotas();setNotaBadge();
-  $("#undoT").textContent="Nota marcada como hecha";$("#undo").hidden=false;clearTimeout(undoT);undoT=setTimeout(commitDel,5000)}
-function undoNote(){if(!undoId)return;clearTimeout(undoT);pendDel.delete(undoId);undoId=null;$("#undo").hidden=true;rNotas();setNotaBadge()}
-async function commitDel(){clearTimeout(undoT);const id=undoId;undoId=null;$("#undo").hidden=true;if(!id)return;
-  try{await apiPost({action:"noteDel",id});pendDel.delete(id)}catch(e){pendDel.delete(id);toast("No se pudo borrar la nota.");render()}}
-$("#undoB").onclick=undoNote;
+/* barra de "Deshacer" genérica: solo una acción pendiente a la vez */
+let undoT=null,undoPend=null;
+function undoBar(label,onCommit,onUndo){if(undoPend)undoPend.commit();
+  undoPend={commit:onCommit,undo:onUndo};$("#undoT").textContent=label;$("#undo").hidden=false;
+  clearTimeout(undoT);undoT=setTimeout(()=>{const p=undoPend;undoPend=null;$("#undo").hidden=true;p&&p.commit()},5000)}
+function undoNow(){if(!undoPend)return;clearTimeout(undoT);const p=undoPend;undoPend=null;$("#undo").hidden=true;p.undo()}
+$("#undoB").onclick=undoNow;
+function doneNote(id){pendDel.add(id);rNotas();setNotaBadge();
+  undoBar("Nota marcada como hecha",
+    async()=>{try{await apiPost({action:"noteDel",id});pendDel.delete(id)}catch(e){pendDel.delete(id);toast("No se pudo borrar la nota.");render()}},
+    ()=>{pendDel.delete(id);rNotas();setNotaBadge()})}
 async function addNote(){const t=$("#nNew").value.trim();if(!t)return;const n={id:"n"+Date.now().toString(36),texto:t,creado:new Date().toISOString()};
   S.notas=(S.notas||[]).concat(n);$("#nNew").value="";rNotas();setNotaBadge();
   try{await apiPost({action:"noteAdd",nota:n})}catch(e){S.notas=S.notas.filter(x=>x.id!==n.id);$("#nNew").value=t;rNotas();setNotaBadge();toast("No se pudo guardar la nota.")}}
@@ -840,7 +867,7 @@ function repay(o){if(!o)return;const l=o.l;
    ${l.bote===CFID?`<p style="color:var(--muted);font-size:13px;margin:10px 0 0">Salió de tu ${esc(cfN())}. Como no se puede recargar, lo normal es que vaya a una de tus cuentas.</p>`:""}<div class="step"><label class="f" for="rTo">¿A dónde va la plata?</label>${paySelect("rTo",l.bote&&l.bote!==CFID?"b:"+l.bote:l.bote===CFID?lastPay():"a:"+accOf(l),{botes:true})}</div>
    <div class="err" id="rE"></div><button class="btn pri" id="rOk" style="width:100%;justify-content:center;padding:12px">Registrar devolución</button>`);
   $("#rX").onclick=closeSheet;
-  $("#rOk").onclick=async()=>{const a=parseFloat($("#rA").value.replace(",","."));const E=$("#rE");if(!(a>0))return E.textContent="Pon un importe mayor que 0.";if(a>o.falta+0.004)return E.textContent=`Solo te debe ${eur(o.falta)}.`;if(!$("#rD").value)return E.textContent="Elige la fecha.";
+  $("#rOk").onclick=async()=>{const a=toNum($("#rA").value);const E=$("#rE");if(!(a>0))return E.textContent="Pon un importe mayor que 0.";if(a>o.falta+0.004)return E.textContent=`Solo te debe ${eur(o.falta)}.`;if(!$("#rD").value)return E.textContent="Elige la fecha.";
     const doc={tipo:"cobro",ref:l._id,sub:l.sub,importe:Math.round(a*100)/100,fecha:$("#rD").value,desc:"Devolución de "+l.sub,creado:new Date().toISOString()};payDec($("#rTo").value,doc);
     $("#rOk").disabled=true;try{await apiPost({action:"add",movs:[doc]});closeSheet();toast(a>=o.falta-0.004?"Préstamo devuelto":"Devolución parcial registrada")}catch(e){$("#rOk").disabled=false;E.textContent="No se pudo guardar."}};
 }
@@ -854,7 +881,7 @@ function planFrom(b,m,v){return (b.plan||[]).filter(x=>x.desde<m).concat({desde:
 function etaWith(b,meta,v){const t=Object.assign({},b,{meta,plan:planFrom(b,mk(now),v)});return meta?eta(t):""}
 function editBote(b){const isNew=!b;const B=Object.assign({nombre:"",meta:"",color:PALETTE[(S.config.botes||[]).length%PALETTE.length],icon:"savings"},b||{});const cm=mk(now);
   const cap=capacity(B.id);const saldo=isNew?0:boteSaldo(B);const tmp=Object.assign({},B,{id:B.id||"__new"});
-  const num=v=>parseFloat(String(v||"").replace(",","."))||0;
+  const num=v=>toNum(String(v||""))||0;
   const info=()=>{const meta=num($("#bM").value),ap=num($("#bA").value),s0=isNew?num($("#bI")?.value):saldo;tmp.inicial=isNew?s0:B.inicial;
     const falta=Math.max(0,meta-s0);let rec=0;if(falta>0&&cap.libre>0){rec=Math.ceil(falta/12/10)*10;if(rec>cap.libre)rec=Math.max(10,Math.floor(cap.libre/10)*10)}
     const opts=[...new Set([Math.round(rec/2/10)*10,rec,rec+50,rec+100].filter(v=>v>0))].sort((x,y)=>x-y);
@@ -875,7 +902,7 @@ function editBote(b){const isNew=!b;const B=Object.assign({nombre:"",meta:"",col
   info();["#bM","#bA","#bI"].forEach(id=>$(id)&&$(id).addEventListener("input",info));
   $("#bX").onclick=closeSheet;
   if($("#bDel"))$("#bDel").onclick=async()=>{const n=cloneCfg();n.botes=n.botes.filter(x=>x.id!==B.id);try{await saveConfig(n);closeSheet();toast("Bote eliminado")}catch(e){$("#bE").textContent="No se pudo eliminar."}};
-  $("#bOk").onclick=async()=>{const nm=$("#bN").value.trim(),meta=num($("#bM").value),ap=parseFloat($("#bA").value.replace(",","."));const E=$("#bE");
+  $("#bOk").onclick=async()=>{const nm=$("#bN").value.trim(),meta=num($("#bM").value),ap=toNum($("#bA").value);const E=$("#bE");
     if(!nm)return E.textContent="Ponle un nombre.";if(!(ap>=0))return E.textContent="El aporte tiene que ser 0 o más.";
     const n=cloneCfg();let t=n.botes.find(x=>x.id===B.id);
     if(!t){t={id:slug(nm)+"-"+Date.now().toString(36).slice(-4),color:B.color,icon:"savings",inicial:Math.max(0,num($("#bI")?.value)),plan:[]};n.botes.push(t)}
@@ -896,7 +923,7 @@ function editDebt(d){if(!d)return;const pr=(S.config.programados||[]).filter(p=>
    <div class="err" id="ddE"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn danger" id="ddDel">Eliminar</button><button class="btn pri" id="ddOk" style="flex:1;justify-content:center">Guardar</button></div>`);
   $("#ddX").onclick=closeSheet;
   $("#ddDel").onclick=async()=>{const n=cloneCfg();n.deudas=n.deudas.filter(x=>x.id!==d.id);n.programados=(n.programados||[]).filter(p=>!(p.tipo==="pago"&&p.deuda===d.id));try{await saveConfig(n);closeSheet();toast("Deuda eliminada")}catch(e){$("#ddE").textContent="No se pudo eliminar."}};
-  $("#ddOk").onclick=async()=>{const nm=$("#ddN").value.trim(),tot=parseFloat($("#ddT").value.replace(",",".")),c=parseInt($("#ddC").value,10),m=$("#ddM").value,dd=parseInt($("#ddD").value,10),E=$("#ddE");
+  $("#ddOk").onclick=async()=>{const nm=$("#ddN").value.trim(),tot=toNum($("#ddT").value),c=parseInt($("#ddC").value,10),m=$("#ddM").value,dd=parseInt($("#ddD").value,10),E=$("#ddE");
     if(!nm)return E.textContent="Ponle un nombre.";if(!(tot>0))return E.textContent="Pon el total.";if(!(c>=1))return E.textContent="Pon las cuotas.";if(!m)return E.textContent="Elige el mes.";if(!(dd>=1&&dd<=31))return E.textContent="Día entre 1 y 31.";
     const falta=Math.max(0,tot-pagado(d)),cuota=Math.round(falta/c*100)/100,last=addM(m,c-1);const n=cloneCfg();const t=n.deudas.find(x=>x.id===d.id);
     t.nombre=nm;t.total=Math.round(tot*100)/100;t.nota=$("#ddNo").value.trim();t.fin=mLabel(last);t.cuotas=c;
@@ -938,6 +965,21 @@ function openSheet(h){$("#sheetBody").innerHTML=h;$("#sheet").hidden=false}
 function closeSheet(){$("#sheet").hidden=true;$("#sheetBody").innerHTML=""}
 $("#sheet").addEventListener("click",e=>{if(e.target.id==="sheet")closeSheet()});
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#sheet").hidden)closeSheet()});
+/* ---------- importes: solo dígitos y un separador decimal (coma o punto), signo opcional ---------- */
+function numClean(v,signed){v=String(v==null?"":v);
+  const neg=!!signed&&/^\s*-/.test(v);
+  v=v.replace(/-/g,"").replace(/[^0-9,.]/g,"");
+  const parts=v.split(/[.,]/);
+  if(parts.length>1){const dec=parts.pop();v=parts.join("")+","+dec}
+  return(neg?"-":"")+v}
+document.addEventListener("input",e=>{const el=e.target;
+  if(!el||el.nodeName!=="INPUT"||!el.classList||!el.classList.contains("num"))return;
+  const clean=numClean(el.value,el.dataset.signed==="1");
+  if(clean===el.value)return;
+  const pos=el.selectionStart,diff=el.value.length-clean.length;
+  el.value=clean;
+  try{const np=Math.max(0,(pos==null?clean.length:pos)-diff);el.setSelectionRange(np,np)}catch(_){}
+},true);
 function toast(t){const el=$("#toast");el.textContent=t;el.hidden=false;clearTimeout(toast.t);toast.t=setTimeout(()=>el.hidden=true,2200)}
 function askName(title,ph,fn){
   const back=$("#sheet").hidden?null:$("#sheetBody").innerHTML;
@@ -954,13 +996,57 @@ function openAdd(p){F={tipo:"gasto",fecha:S.month===mk(now)?todayStr:S.month+"-0
   if(p){F.tipo=p.tipo==="aporte"?"ahorro":p.tipo;F.accion="aporte";F.cat=p.cat;F.sub=p.sub;F.bote=p.bote;F.deuda=p.deuda;F.importe=String(p.importe).replace(".",",");F.desc=p.nombre;F.prog=p;if(p.cuenta){F.pay="a:"+p.cuenta;F.payT=1}
     if(S.month!==mk(now))F.fecha=p.fecha}
   drawAdd()}
+/* pago rápido: un pago programado con todos sus datos ya conocidos se registra en un clic */
+async function quickPay(p,btn){if(!canWrite)return;
+  const importe=Math.round((+p.importe||0)*100)/100;if(!(importe>0))return openAdd(p);
+  const pos=p.tipo==="ingreso",fecha=S.month===mk(now)?todayStr:p.fecha;
+  const doc={importe,fecha,desc:p.nombre,creado:new Date().toISOString()};let pay="";
+  if(p.tipo==="gasto"){doc.tipo="gasto";doc.cat=p.cat;doc.sub=p.sub;
+    pay=p.cuenta?"a:"+p.cuenta:(p.cat==="alimentacion"&&cfOn()?"cf":lastPay());payDec(pay,doc);
+    if(doc.desdeBote&&doc.desdeBote!==CFID){const b=bote(doc.desdeBote);if(b&&boteSaldo(b)<importe-0.004)return openAdd(p)}}
+  else if(p.tipo==="ingreso"){doc.tipo="ingreso";doc.cat=p.cat;doc.sub=p.sub;
+    if(p.cat!=="in-alimentacion"){pay=p.cuenta?"a:"+p.cuenta:"a:"+baseAcc();payDec(pay,doc)}}
+  else if(p.tipo==="pago"){doc.tipo="pago";doc.deuda=p.deuda;pay=p.cuenta?"a:"+p.cuenta:"a:"+baseAcc();payDec(pay,doc)}
+  else if(p.tipo==="aporte"){doc.tipo="aporte";doc.bote=p.bote;pay=p.cuenta?"a:"+p.cuenta:"a:"+(bote(p.bote)?.cuenta||baseAcc());payDec(pay,doc)}
+  else return openAdd(p);
+  const extra=[];
+  if(doc.tipo==="ingreso"&&doc.cuenta){const def=S.config.reparto?.[doc.cat]||{};
+    accs().filter(a=>a.id!==doc.cuenta).forEach(a=>{const v=Math.round((+def[a.id]||0)*100)/100;if(v>0&&v<=importe+0.004)extra.push({tipo:"transferencia",cuenta:doc.cuenta,destino:a.id,importe:v,fecha:doc.fecha,desc:"Reparto · "+doc.desc,creado:doc.creado})})}
+  if(btn)btn.disabled=true;
+  try{await apiPost({action:"add",movs:[doc].concat(extra)});
+    if(doc.tipo==="gasto"&&pay.startsWith("a:"))try{localStorage.setItem("plata_lastPay",pay)}catch(e){}
+    const added=S.movs.find(x=>x.creado===doc.creado&&x.tipo===doc.tipo&&Math.abs((+x.importe||0)-importe)<0.005);
+    undoBar(pos?"Cobro registrado":"Pago registrado",()=>{},added?async()=>{try{await apiPost({action:"del",id:added._id})}catch(e){toast("No se pudo deshacer.")}}:()=>{})}
+  catch(e){toast("No se pudo guardar.");if(btn)btn.disabled=false}}
+/* menú de una mensualidad pendiente: pagar con cambios, omitir, aplazar o editar la programación */
+function progMenu(p){const isAuto=!!p.auto;const kind=isAuto?"bote":"programado";
+  const ownerId=isAuto?p.bote:(p.aplazadoDe?String(p.id).split("@")[0]:p.id);const m=p.aplazadoDe||S.month;
+  openSheet(`<div class="ct"><h2>${esc(p.nombre)}</h2><button class="ib" id="pmX" aria-label="Cerrar"><span class="ms">close</span></button></div>
+   <div style="display:grid;gap:8px;margin-top:10px">
+    <button class="btn" id="pmEdit" style="justify-content:flex-start"><span class="ms">tune</span>Pagar con cambios</button>
+    <button class="btn" id="pmOmit" style="justify-content:flex-start"><span class="ms">visibility_off</span>Omitir este mes</button>
+    <button class="btn" id="pmDefer" style="justify-content:flex-start"><span class="ms">event</span>Aplazar a otra fecha</button>
+    ${isAuto?"":`<button class="btn" id="pmProg" style="justify-content:flex-start"><span class="ms">edit_calendar</span>Editar programación</button>`}
+   </div><div class="err" id="pmE"></div>`);
+  $("#pmX").onclick=closeSheet;
+  $("#pmEdit").onclick=()=>{closeSheet();openAdd(p)};
+  $("#pmOmit").onclick=async()=>{$("#pmOmit").disabled=true;try{await setOver(kind,ownerId,m,"omitido");closeSheet();toast("Omitido este mes")}catch(e){$("#pmE").textContent="No se pudo guardar."}};
+  $("#pmDefer").onclick=()=>{openSheet(`<div class="ct"><h2>Aplazar ${esc(p.nombre)}</h2><button class="ib" id="pfX" aria-label="Cerrar"><span class="ms">close</span></button></div>
+     <p style="color:var(--muted);margin:6px 0 0">Este mes no se descuenta nada; el pago pasa a la nueva fecha.</p>
+     <div class="step"><label class="f" for="pfD">Nueva fecha</label><input id="pfD" type="date" value="${esc(p.fecha)}" style="height:56px"></div>
+     <div class="err" id="pfE"></div><button class="btn pri" id="pfOk" style="width:100%;justify-content:center;padding:12px;margin-top:8px">Aplazar</button>`);
+    $("#pfX").onclick=closeSheet;
+    $("#pfOk").onclick=async()=>{const nf=$("#pfD").value;if(!nf)return $("#pfE").textContent="Elige una fecha.";
+      $("#pfOk").disabled=true;try{await setOver(kind,ownerId,m,{aplaza:nf});closeSheet();toast("Aplazado a "+mLabel(nf.slice(0,7)))}catch(e){$("#pfOk").disabled=false;$("#pfE").textContent="No se pudo guardar."}}};
+  if($("#pmProg"))$("#pmProg").onclick=()=>{closeSheet();const real=(S.config.programados||[]).find(x=>x.id===ownerId);editProg(real||p)};
+}
 function editMov(x){if(!x)return;
   if(x.tipo==="ajuste"){openSheet(`<div class="ct"><h2>Ajuste de saldo</h2><button class="ib" id="jX" aria-label="Cerrar"><span class="ms">close</span></button></div>
      <p style="color:var(--muted);margin:6px 0 0">${esc(accName(accOf(x)))} · ${esc(x.fecha)}. Positivo si la app tenía de menos; negativo si tenía de más.</p>
-     <div class="step"><label class="f" for="jA">Importe (€)</label><input id="jA" class="big num" inputmode="decimal" value="${esc(String(x.importe).replace(".",","))}"></div>
+     <div class="step"><label class="f" for="jA">Importe (€)</label><input id="jA" class="big num" inputmode="decimal" data-signed="1" value="${esc(String(x.importe).replace(".",","))}"></div>
      <div class="err" id="jE"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn danger" id="jDel">Eliminar</button><button class="btn pri" id="jOk" style="flex:1;justify-content:center">Guardar cambios</button></div>`);
     $("#jX").onclick=closeSheet;$("#jDel").onclick=()=>confirmDel(x._id);
-    $("#jOk").onclick=async()=>{const a=parseFloat($("#jA").value.replace(",","."));if(!isFinite(a))return $("#jE").textContent="Pon un número.";try{await apiPost({action:"upd",mov:Object.assign({},x,{importe:Math.round(a*100)/100})});closeSheet();toast("Cambios guardados")}catch(e){$("#jE").textContent="No se pudo guardar."}};return}
+    $("#jOk").onclick=async()=>{const a=toNum($("#jA").value);if(!isFinite(a))return $("#jE").textContent="Pon un número.";try{await apiPost({action:"upd",mov:Object.assign({},x,{importe:Math.round(a*100)/100})});closeSheet();toast("Cambios guardados")}catch(e){$("#jE").textContent="No se pudo guardar."}};return}
   if(x.tipo==="cobro"){const loan=S.movs.find(l=>l._id===x.ref);
     openSheet(`<div class="ct"><h2>Editar devolución</h2><button class="ib" id="cX" aria-label="Cerrar"><span class="ms">close</span></button></div>
      <p style="color:var(--muted);margin:6px 0 0">${esc(x.sub||"")} · préstamo de ${loan?eur(+loan.importe||0):"—"}</p>
@@ -968,7 +1054,7 @@ function editMov(x){if(!x)return;
      <div class="step"><label class="f" for="cTo">¿A dónde fue la plata?</label>${paySelect("cTo",payEnc(x),{botes:true})}</div>
      <div class="err" id="cE"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn danger" id="cDel">Eliminar</button><button class="btn pri" id="cOk" style="flex:1;justify-content:center">Guardar cambios</button></div>`);
     $("#cX").onclick=closeSheet;$("#cDel").onclick=()=>confirmDel(x._id);
-    $("#cOk").onclick=async()=>{const a=parseFloat($("#cA").value.replace(",","."));if(!(a>0))return $("#cE").textContent="Pon un importe mayor que 0.";if(!$("#cD").value)return $("#cE").textContent="Elige la fecha.";
+    $("#cOk").onclick=async()=>{const a=toNum($("#cA").value);if(!(a>0))return $("#cE").textContent="Pon un importe mayor que 0.";if(!$("#cD").value)return $("#cE").textContent="Elige la fecha.";
       const d=Object.assign({},x,{importe:Math.round(a*100)/100,fecha:$("#cD").value});delete d.bote;delete d.cuenta;payDec($("#cTo").value,d);
       $("#cOk").disabled=true;try{await apiPost({action:"upd",mov:d});closeSheet();toast("Cambios guardados")}catch(e){$("#cOk").disabled=false;$("#cE").textContent="No se pudo guardar."}};return}
   F={editId:x._id,creado:x.creado,importe:String(x.importe).replace(".",","),fecha:x.fecha,desc:x.desc||"",accion:"aporte"};
@@ -986,7 +1072,7 @@ function repartoHtml(){if(F.tipo!=="ingreso"||F.editId||!F.cat||F.cat==="in-alim
   const def=S.config.reparto?.[F.cat]||{};F.rep=F.rep||{};const cn=cI().find(c=>c.id===F.cat)?.nombre||"este ingreso";
   let h=others.length?`<div class="step"><label class="f">Reparto · ¿pasas algo a otra cuenta?</label>${others.map(a=>`<div class="reprow"><span>Pasar a <b>${esc(a.nombre)}</b></span><input data-rep="${esc(a.id)}" class="num" inputmode="decimal" placeholder="0" value="${esc(String(F.rep[a.id]??(def[a.id]||"")).replace(".",","))}"></div>`).join("")}
     <div class="chk" style="margin-top:8px"><input type="checkbox" id="aRepSave"${F.repSave?" checked":""}><label for="aRepSave">Usar este reparto siempre para ${esc(cn)}</label></div></div>`:"";
-  const rr=rule(),vb=rr&&bote(rr.bote);if(rr&&(rr.cats||[]).includes(F.cat)){if(F.vj===undefined)F.vj=(rr.on||[]).includes(F.cat);const amt=parseFloat(String(F.importe||"").replace(",","."));const half=amt>0?String(Math.round(amt*(rr.pct||50)/100*100)/100).replace(".",","):"";
+  const rr=rule(),vb=rr&&bote(rr.bote);if(rr&&(rr.cats||[]).includes(F.cat)){if(F.vj===undefined)F.vj=(rr.on||[]).includes(F.cat);const amt=toNum(String(F.importe||""));const half=amt>0?String(Math.round(amt*(rr.pct||50)/100*100)/100).replace(".",","):"";
     h+=`<div class="step banner" style="background:var(--blue-soft)"><div class="chk"><input type="checkbox" id="aVj"${F.vj?" checked":""}><label for="aVj">Enviar una parte a <b>${esc(vb.nombre)}</b></label></div><div class="reprow"><span style="color:var(--muted);font-size:13px">Por defecto, el ${rr.pct||50} %. Desmárcalo para dejarlo todo en tu cuenta.</span><input id="aVjA" class="num" inputmode="decimal" value="${esc(F.vjT?F.vjA:half)}"${F.vj?"":" disabled"}></div></div>`}
   return h}
 function payDefault(){const p=F.prog,B=baseAcc();
@@ -1047,8 +1133,8 @@ function drawAdd(){
   $$("[data-deuda]").forEach(b=>b.onclick=()=>{keep();F.deuda=b.dataset.deuda;autoFill();drawAdd()});
   if($("#newCat"))$("#newCat").onclick=()=>{keep();const kind=F.tipo;askName("Nueva categoría","Ej.: Familia, Mascotas…",async n=>{const id=await addCat(kind,n);F.cat=id;F.sub=undefined;setTimeout(drawAdd,0)})};
   if($("#newSub"))$("#newSub").onclick=()=>{keep();const kind=F.tipo,id=F.cat;askName("Nueva subcategoría","Ej.: Gas, Cine, Seguro…",async n=>{await addSub(kind,id,n);F.sub=n;setTimeout(drawAdd,0)})};
-  $("#aAmt").oninput=()=>{$("#aErr").textContent="";if($("#aVjA")&&!F.vjT){const v=parseFloat($("#aAmt").value.replace(",","."));$("#aVjA").value=v>0?String(Math.round(v*((rule()?.pct)||50)/100*100)/100).replace(".",","):""}};
-  $("#aSave").onclick=async()=>{keep();const a=parseFloat(String(F.importe).replace(",","."));const E=$("#aErr");
+  $("#aAmt").oninput=()=>{$("#aErr").textContent="";if($("#aVjA")&&!F.vjT){const v=toNum($("#aAmt").value);$("#aVjA").value=v>0?String(Math.round(v*((rule()?.pct)||50)/100*100)/100).replace(".",","):""}};
+  $("#aSave").onclick=async()=>{keep();const a=toNum(String(F.importe));const E=$("#aErr");
     if(!(a>0))return E.textContent="Pon un importe mayor que 0.";if(!F.fecha)return E.textContent="Elige la fecha.";
     const doc={importe:Math.round(a*100)/100,fecha:F.fecha,desc:(F.desc||"").trim(),creado:new Date().toISOString()};
     if(F.tipo==="gasto"||F.tipo==="ingreso"){if(!F.cat)return E.textContent="Elige una categoría.";if(!F.sub)return E.textContent="Elige una subcategoría.";doc.tipo=F.tipo;doc.cat=F.cat;doc.sub=F.sub;if(F.tipo==="gasto"&&F.ref&&F.editId)doc.ref=F.ref;if(F.tipo==="gasto"||F.cat!=="in-alimentacion")payDec(payVal(),doc);
@@ -1061,7 +1147,7 @@ function drawAdd(){
       if(payVal().startsWith("a:"))try{localStorage.setItem("plata_lastPay",payVal())}catch(e){}}
     else{if(!F.deuda)return E.textContent="Elige la deuda.";doc.tipo="pago";doc.deuda=F.deuda;payDec(payVal(),doc)}
     const extra=[];let repSave=null;
-    if(doc.tipo==="ingreso"&&!F.editId&&doc.cuenta){const num=v=>parseFloat(String(v||"").replace(",","."))||0;let used=0;const rp={};
+    if(doc.tipo==="ingreso"&&!F.editId&&doc.cuenta){const num=v=>toNum(String(v||""))||0;let used=0;const rp={};
       accs().filter(a=>a.id!==doc.cuenta).forEach(a=>{const v=Math.round(num(F.rep?.[a.id])*100)/100;rp[a.id]=v;if(v>0){used+=v;extra.push({tipo:"transferencia",cuenta:doc.cuenta,destino:a.id,importe:v,fecha:doc.fecha,desc:"Reparto · "+(doc.desc||doc.sub||"ingreso"),creado:doc.creado})}});
       if(F.vj&&rule()){const v=Math.round(num(F.vjA)*100)/100;if(v>0){used+=v;extra.push({tipo:"aporte",bote:rule().bote,cuenta:doc.cuenta,importe:v,fecha:doc.fecha,desc:"Parte de "+(doc.desc||doc.sub||"ingreso extra"),creado:doc.creado})}}
       if(used>doc.importe+0.004)return E.textContent=`Repartes ${eur(used)} y el ingreso es de ${eur(doc.importe)}.`;
@@ -1098,7 +1184,7 @@ $("#accNew").onclick=()=>canWrite&&editAcc(null);$("#accCuadre").onclick=()=>can
 function editAcc(a){const isNew=!a;const used=a?S.movs.some(x=>accOf(x)===a.id&&x.cuenta===a.id)||(S.config.programados||[]).some(p=>p.cuenta===a.id):false;
   openSheet(`<div class="ct"><h2>${isNew?"Nueva cuenta":"Editar "+esc(a.nombre)}</h2><button class="ib" id="kX" aria-label="Cerrar"><span class="ms">close</span></button></div>
    <div class="step"><label class="f" for="kN">Nombre</label><input id="kN" value="${esc(a?.nombre||"")}" placeholder="Ej.: PayPal, Trade Republic…"></div>
-   ${isNew?`<div class="step"><label class="f" for="kS">¿Cuánto tienes hoy en esta cuenta? (€)</label><input id="kS" class="num" inputmode="decimal" placeholder="0"></div>`:""}
+   ${isNew?`<div class="step"><label class="f" for="kS">¿Cuánto tienes hoy en esta cuenta? (€)</label><input id="kS" class="num" inputmode="decimal" data-signed="1" placeholder="0"></div>`:""}
    <div class="chk step"><input type="checkbox" id="kD"${S.config.cuentaGasto===a?.id?" checked":""}><label for="kD">Usarla por defecto para los gastos</label></div>
    <div class="err" id="kE"></div><div style="display:flex;gap:8px;flex-wrap:wrap">${!isNew&&!used&&accs().length>1&&Math.abs(accBal(a.id))<0.005?`<button class="btn danger" id="kDel">Eliminar</button>`:""}<button class="btn pri" id="kOk" style="flex:1;justify-content:center">Guardar</button></div>`);
   $("#kX").onclick=closeSheet;
@@ -1106,16 +1192,16 @@ function editAcc(a){const isNew=!a;const used=a?S.movs.some(x=>accOf(x)===a.id&&
   $("#kOk").onclick=async()=>{const nm=$("#kN").value.trim();if(!nm)return $("#kE").textContent="Ponle un nombre.";const n=cloneCfg();n.cuentas=n.cuentas||[];let t=n.cuentas.find(x=>x.id===a?.id);
     if(!t){let id=slug(nm);while(n.cuentas.some(x=>x.id===id))id+="-2";t={id,color:PALETTE[(n.cuentas.length+3)%PALETTE.length],icon:"account_balance"};n.cuentas.push(t)}
     t.nombre=nm;if($("#kD").checked)n.cuentaGasto=t.id;else if(n.cuentaGasto===t.id&&n.cuentas.length>1)n.cuentaGasto=n.cuentas.find(x=>x.id!==t.id).id;
-    const s0=isNew?parseFloat(($("#kS").value||"").replace(",",".")):0;$("#kOk").disabled=true;
+    const s0=isNew?toNum(($("#kS").value||"")):0;$("#kOk").disabled=true;
     try{await saveConfig(n);if(s0)await apiPost({action:"add",movs:[{tipo:"ajuste",cuenta:t.id,importe:Math.round(s0*100)/100,fecha:todayStr,desc:"Saldo inicial · "+nm,creado:new Date().toISOString()}]});closeSheet();toast("Guardado")}catch(e){$("#kOk").disabled=false;$("#kE").textContent="No se pudo guardar."}};
 }
 function cuadre(){if(!S.config.cuentas)return;const L=ledger(mk(now));const A=accs();
   openSheet(`<div class="ct"><h2>Cuadrar saldos</h2><button class="ib" id="qX" aria-label="Cerrar"><span class="ms">close</span></button></div>
    <p style="color:var(--muted);margin:6px 0 0">Pon lo que ves hoy en la app de cada banco, sin contar botes${cfOn()?" ni "+esc(cfN()):""}. Si no coincide con lo que calcula la app, se registra un “Ajuste de saldo” por la diferencia.</p>
-   ${A.map(a=>`<div class="step"><label class="f" for="q_${esc(a.id)}">${esc(a.nombre)} <span style="color:var(--faint);font-weight:400">· la app calcula ${eur(L.acc[a.id]||0)}</span></label><input id="q_${esc(a.id)}" data-qa="${esc(a.id)}" class="big num" inputmode="decimal" placeholder="0,00"></div>`).join("")}
+   ${A.map(a=>`<div class="step"><label class="f" for="q_${esc(a.id)}">${esc(a.nombre)} <span style="color:var(--faint);font-weight:400">· la app calcula ${eur(L.acc[a.id]||0)}</span></label><input id="q_${esc(a.id)}" data-qa="${esc(a.id)}" class="big num" inputmode="decimal" data-signed="1" placeholder="0,00"></div>`).join("")}
    <div class="err" id="qE"></div><button class="btn pri" id="qOk" style="width:100%;justify-content:center;padding:12px">Guardar saldos</button>`);
   $("#qX").onclick=closeSheet;
-  $("#qOk").onclick=async()=>{const movs=[];let miss=false;$$("[data-qa]").forEach(i=>{const v=i.value.trim();if(!v){miss=true;return}const real=parseFloat(v.replace(",","."));if(!isFinite(real)){miss=true;return}
+  $("#qOk").onclick=async()=>{const movs=[];let miss=false;$$("[data-qa]").forEach(i=>{const v=i.value.trim();if(!v){miss=true;return}const real=toNum(v);if(!isFinite(real)){miss=true;return}
       const d=Math.round((real-(L.acc[i.dataset.qa]||0))*100)/100;if(Math.abs(d)>=0.01)movs.push({tipo:"ajuste",cuenta:i.dataset.qa,importe:d,fecha:todayStr,desc:"Ajuste de saldo · "+accName(i.dataset.qa),creado:new Date().toISOString()})});
     if(miss)return $("#qE").textContent="Pon el saldo de todas las cuentas (0 si está vacía).";$("#qOk").disabled=true;
     try{if(movs.length)await apiPost({action:"add",movs});if(S.config.pendCuadre){const n=cloneCfg();delete n.pendCuadre;await saveConfig(n)}closeSheet();toast(movs.length?"Saldos cuadrados":"Ya estaba todo cuadrado")}catch(e){$("#qOk").disabled=false;$("#qE").textContent="No se pudo guardar."}};
@@ -1126,7 +1212,7 @@ function editLimit(id){const c=cG().find(x=>x.id===id);if(!c)return;const cur=S.
    <div class="step"><label class="f" for="lA">Límite mensual (€)</label><input id="lA" class="big num" inputmode="decimal" value="${cur?esc(String(cur).replace(".",",")):""}" placeholder="200"></div>
    <div class="err" id="lE"></div><div style="display:flex;gap:8px;flex-wrap:wrap">${cur?`<button class="btn danger" id="lDel">Quitar límite</button>`:""}<button class="btn pri" id="lOk" style="flex:1;justify-content:center">Guardar</button></div>`);
   $("#lX").onclick=closeSheet;const save=async v=>{const n=cloneCfg();n.limites=n.limites||{};if(v)n.limites[id]=v;else delete n.limites[id];try{await saveConfig(n);closeSheet();toast("Guardado")}catch(e){$("#lE").textContent="No se pudo guardar."}};
-  if($("#lDel"))$("#lDel").onclick=()=>save(0);$("#lOk").onclick=()=>{const v=parseFloat($("#lA").value.replace(",","."));if(!(v>0))return $("#lE").textContent="Pon un importe mayor que 0.";save(Math.round(v*100)/100)};
+  if($("#lDel"))$("#lDel").onclick=()=>save(0);$("#lOk").onclick=()=>{const v=toNum($("#lA").value);if(!(v>0))return $("#lE").textContent="Pon un importe mayor que 0.";save(Math.round(v*100)/100)};
 }
 function rLimits(){const box=$("#anLim"),lim=S.config.limites||{},ids=Object.keys(lim).filter(id=>lim[id]>0&&cG().some(c=>c.id===id));box.hidden=S.an!=="mes"||!ids.length;if(box.hidden)return;
   const sp={};inMonth(S.month).filter(isSpend).forEach(x=>sp[x.cat]=(sp[x.cat]||0)+(+x.importe||0));
@@ -1160,13 +1246,13 @@ function editProg(p){const P=Object.assign({tipo:"gasto",dia:1,desde:S.month},p|
     const keep=()=>{P.nombre=$("#eN").value.trim();P.importe=$("#eI").value;P.dia=$("#eDia").value;P.vence=$("#eV").value;P.habil=$("#eH").checked;P.desde=$("#eDe").value;P.hasta=$("#eHa").value;P.mtxt=$("#eM").value;if($("#eC"))P.cat=$("#eC").value;if($("#eS"))P.sub=$("#eS").value;if($("#eD"))P.deuda=$("#eD").value;if($("#eCu"))P.cuenta=$("#eCu").value};
     $("#eX").onclick=closeSheet;$("#eT").onchange=()=>{keep();P.tipo=$("#eT").value;P.cat=P.sub=undefined;draw()};if($("#eC"))$("#eC").onchange=()=>{keep();P.sub=undefined;draw()};
     if($("#eDel"))$("#eDel").onclick=async()=>{const n=cloneCfg();n.programados=(n.programados||[]).filter(x=>x.id!==P.id);try{await saveConfig(n);closeSheet();toast("Eliminado")}catch(e){$("#eErr").textContent="No se pudo eliminar."}};
-    $("#eOk").onclick=async()=>{keep();const imp=parseFloat(String(P.importe).replace(",","."));const dia=parseInt(P.dia,10);const E=$("#eErr");
+    $("#eOk").onclick=async()=>{keep();const imp=toNum(String(P.importe));const dia=parseInt(P.dia,10);const E=$("#eErr");
       if(!P.nombre)return E.textContent="Ponle un nombre.";if(!(imp>0))return E.textContent="Pon un importe mayor que 0.";if(!(dia>=1&&dia<=31))return E.textContent="El día tiene que estar entre 1 y 31.";if(!P.desde)return E.textContent="Elige desde qué mes.";
       if(P.hasta&&P.hasta<P.desde)return E.textContent="“Hasta” no puede ser antes que “Desde”.";
       const meses=String(P.mtxt||"").split(/[ ,;]+/).map(Number).filter(k=>k>=1&&k<=12);
       const q={id:P.id||("p-"+Date.now().toString(36)),nombre:P.nombre,tipo:P.tipo,importe:Math.round(imp*100)/100,dia,desde:P.desde};
       if(P.tipo==="pago")q.deuda=P.deuda;else{q.cat=P.cat;q.sub=P.sub}
-      if(P.cuenta&&$("#eCu"))q.cuenta=P.cuenta;if(P.hasta)q.hasta=P.hasta;if(P.habil)q.habil=true;const v=parseInt(P.vence,10);if(v>=1&&v<=31)q.vence=v;if(meses.length)q.meses=meses;if(p&&p.nota)q.nota=p.nota;
+      if(P.cuenta&&$("#eCu"))q.cuenta=P.cuenta;if(P.hasta)q.hasta=P.hasta;if(P.habil)q.habil=true;const v=parseInt(P.vence,10);if(v>=1&&v<=31)q.vence=v;if(meses.length)q.meses=meses;if(p&&p.nota)q.nota=p.nota;if(p&&p.over)q.over=p.over;
       const n=cloneCfg();n.programados=(n.programados||[]).filter(x=>x.id!==q.id).concat(q);$("#eOk").disabled=true;
       try{await saveConfig(n);closeSheet();toast("Guardado")}catch(e){$("#eOk").disabled=false;E.textContent="No se pudo guardar."}};
   };draw();
@@ -1180,7 +1266,7 @@ function newDebt(){
    <div class="step"><label class="f" for="ndNo">Nota (opcional)</label><input id="ndNo" placeholder="0 % de interés, a quién se lo debes…"></div>
    <div class="err" id="ndE"></div><button class="btn pri" id="ndOk" style="width:100%;justify-content:center;padding:12px">Crear deuda</button>`);
   $("#ndX").onclick=closeSheet;
-  $("#ndOk").onclick=async()=>{const nm=$("#ndN").value.trim(),tot=parseFloat($("#ndT").value.replace(",",".")),cu=parseInt($("#ndC").value,10),m0=$("#ndM").value,dia=parseInt($("#ndD").value,10),E=$("#ndE");
+  $("#ndOk").onclick=async()=>{const nm=$("#ndN").value.trim(),tot=toNum($("#ndT").value),cu=parseInt($("#ndC").value,10),m0=$("#ndM").value,dia=parseInt($("#ndD").value,10),E=$("#ndE");
     if(!nm)return E.textContent="Escribe qué es.";if(!(tot>0))return E.textContent="Pon el total.";if(!(cu>=1))return E.textContent="Pon el número de cuotas.";if(!m0)return E.textContent="Elige el mes.";if(!(dia>=1&&dia<=31))return E.textContent="Día entre 1 y 31.";
     const id=slug(nm)+"-"+Date.now().toString(36).slice(-4),last=addM(m0,cu-1),cuota=Math.round(tot/cu*100)/100;const n=cloneCfg();
     n.deudas=(n.deudas||[]).concat({id,nombre:nm,total:Math.round(tot*100)/100,cuotas:cu,nota:($("#ndNo").value.trim()||`${cu} cuota${cu>1?"s":""} de ${eur(cuota)}`),fin:mLabel(last),icon:"credit_card"});
@@ -1222,6 +1308,7 @@ render();
 
 function apply(j){S.role=j.role||"admin";canWrite=S.role==="admin";document.body.classList.toggle("ro",!canWrite);document.body.classList.toggle("admin",canWrite);$("#editTog").hidden=!canWrite;
   if(apply.first===undefined){apply.first=1;let v=false;try{v=localStorage.getItem("plata_edit")==="1"}catch(e){}setEdit(v)}else if(!canWrite)setEdit(false);$("#roBadge").hidden=canWrite;S.config=j.config||{};S.deudas=(S.config.deudas||[]).map(d=>Object.assign({},d));S.movs=j.movs||[];S.notas=canWrite?(j.notas||[]):[];
+  for(const k in _bal)delete _bal[k];
   $("#fab").hidden=!canWrite;$("#status").hidden=true;render()}
 /* ---------- conexión con Supabase ---------- */
 const SUPABASE_URL="https://itcvwvywgzljzrqgsjil.supabase.co";      // PEGA AQUÍ la Project URL de Supabase (Settings → API)
@@ -1240,7 +1327,8 @@ en:{"Entrar":"Sign in","Crear cuenta":"Create account","Correo":"Email","Contras
 "Ingresos":"Income","Lo que entra cada mes. Si cobras en una cuenta y luego pasas una parte a otra, dímelo y la app lo hace sola cada vez.":"What comes in every month. If you get paid into one account and then move part of it to another, tell me and the app will do it for you each time.","Sueldo mensual":"Monthly salary","No tengo un sueldo fijo":"I don't have a fixed salary","Día de cobro":"Payday","¿En qué cuenta entra?":"Which account does it go into?","¿Pasas una parte a otra cuenta?":"Do you move part of it to another account?","Pasar a {n}":"Move to {n}","Pagas extra":"Extra payments","Por ejemplo la de Navidad o la de verano. Si no tienes, déjalo vacío.":"For example a Christmas or summer bonus. Leave it empty if you don't have any.","Nombre":"Name","Mes":"Month","Importe":"Amount","+ Añadir paga extra":"+ Add extra payment","Paga de Navidad":"Christmas bonus","Paga de verano":"Summer bonus",
 "Gastos fijos":"Fixed expenses","Lo que pagas todos los meses casi igual. Toca los que tengas y pon el importe y el día. Lo que no sepas exacto, ponlo aproximado.":"What you pay every month, roughly the same. Tap the ones you have and add the amount and day. If you don't know exactly, estimate.","Día":"Day","Sale de":"Paid from","Categoría":"Category","Otro gasto fijo":"Other fixed expense","Escribe el nombre de cada gasto.":"Write a name for each expense.",
 "Deudas":"Debts","¿Estás pagando algo a plazos o le debes dinero a alguien? La app te avisa de cada cuota y la archiva cuando termines.":"Are you paying something in installments or owe someone money? The app reminds you of each payment and archives it when you finish.","¿Qué es?":"What is it?","Te falta pagar":"Still to pay","Cuota al mes":"Monthly payment","+ Añadir deuda":"+ Add debt","No tengo deudas":"I have no debts","Completa nombre, lo que falta y la cuota.":"Fill in the name, what's left and the payment.",
-"Objetivos y ahorro":"Goals and savings","Los botes son dinero apartado para algo. Elige los que quieras, pon cuánto tienes ya y cuánto quieres apartar al mes.":"Pots are money set aside for something. Choose the ones you want, how much you already have and how much to set aside each month.","Fondo de emergencia":"Emergency fund","Imprevistos":"Unexpected expenses","Viajes":"Travel","Otro objetivo":"Other goal","Ya tengo":"I already have","Meta":"Goal","Al mes":"Per month","Dónde está":"Where it is","Te recomiendo unos {v}: tres meses de tus gastos fijos.":"I'd suggest about {v}: three months of your fixed expenses.","Cuando cobres una paga extra, apartar":"When you get an extra payment, set aside","para":"for","Límite al mes para salidas y comer fuera (opcional)":"Monthly limit for going out and eating out (optional)",
+"Objetivos y ahorro":"Goals and savings","Los botes son dinero apartado para algo. Elige los que quieras, pon cuánto tienes ya y cuánto quieres apartar al mes.":"Pots are money set aside for something. Choose the ones you want, how much you already have and how much to set aside each month.","Fondo de emergencia":"Emergency fund","Imprevistos":"Unexpected expenses","Viajes":"Travel","Otro objetivo":"Other goal","Ya tengo":"I already have","Meta":"Goal","Al mes":"Per month","Dónde está":"Where it is","Meses de cobertura":"Months of cover","Incluir también la cuota de mis deudas ({v}/mes)":"Also include my debt payments ({v}/month)","Te recomiendo unos {v}: {m} meses de tus {f} de gastos fijos{d}.":"I'd suggest about {v}: {m} months of your {f} in fixed expenses{d}.","de cuotas de deudas":"in debt payments","No cuenta el capital pendiente de tus deudas, solo lo que pagas al mes.":"This doesn't count what you still owe on your debts, only what you pay each month.","Cuando cobres una paga extra, apartar":"When you get an extra payment, set aside","para":"for","Límite al mes para salidas y comer fuera (opcional)":"Monthly limit for going out and eating out (optional)",
+"Antes de empezar":"Before you start","Esto ya vencía este mes, antes de hoy. Si ya lo pagaste o cobraste, lo dejamos marcado para que no aparezca pendiente ni se descuente dos veces de tu saldo inicial.":"These were already due this month, before today. If you already paid or received them, we'll mark them so they don't show as pending or get deducted twice from your starting balance.","Marcar todo como ya pagado":"Mark all as already paid","Marcar todo como pendiente":"Mark all as pending","Ya pagado":"Already done","Pendiente":"Pending","No tienes nada vencido antes de hoy. Puedes seguir.":"Nothing was due before today. You can continue.",
 "Resumen":"Summary","Así queda tu mes. Puedes cambiar todo después.":"Here's your month. You can change everything later.","Ingresos al mes":"Monthly income","Gastos fijos":"Fixed expenses","Cuotas de deudas":"Debt payments","Ahorro en botes":"Savings in pots","Te queda para el día a día":"Left for everyday spending","Con tus fijos y ahorros, no te llega. Prueba a bajar lo que apartas en los botes.":"With your fixed costs and savings it doesn't add up. Try lowering what you set aside in pots.","Además, en tu tarjeta de comida: {v} al mes.":"Plus, on your meal card: {v} a month.","Y pagas extra: {v} al año.":"And extra payments: {v} a year.",
 "Tu cuenta":"Your account","Cerrar sesión":"Sign out","Borrar mi cuenta":"Delete my account","Compartir en solo lectura":"Share read-only","Crea un código y mándaselo a quien quieras. Podrá ver tus finanzas, pero no cambiar nada. Un código sirve para una persona.":"Create a code and send it to whoever you want. They'll see your finances but can't change anything. Each code works for one person.","Crear código":"Create code","Pendiente":"Pending","En uso":"In use","Quitar acceso":"Remove access","¿Te pasaron un código?":"Did someone send you a code?","Mis finanzas":"My finances","Finanzas de {n}":"{n}'s finances","Código no válido o ya usado.":"Invalid or already used code.","Ahora puedes ver las finanzas de {n}.":"You can now see {n}'s finances.","Guardar":"Save","Perfil":"Profile","Copiado":"Copied","Tus datos":"Your data","Importar datos (JSON)":"Import data (JSON)"},
 pt:{"Entrar":"Entrar","Crear cuenta":"Criar conta","Correo":"Email","Contraseña":"Palavra-passe","Mínimo 6 caracteres":"Mínimo 6 caracteres","¿Olvidaste tu contraseña?":"Esqueceste-te da palavra-passe?","Tus finanzas, claras y en un solo sitio.":"As tuas finanças, claras e num só sítio.","Correo o contraseña incorrectos.":"Email ou palavra-passe incorretos.","Ese correo ya tiene cuenta. Entra con tu contraseña.":"Esse email já tem conta. Entra com a tua palavra-passe.","Confirma tu correo: te enviamos un enlace.":"Confirma o teu email: enviámos-te um link.","Escribe tu correo.":"Escreve o teu email.","La contraseña necesita al menos 6 caracteres.":"A palavra-passe precisa de pelo menos 6 caracteres.","Te enviamos un correo para cambiar la contraseña.":"Enviámos-te um email para mudar a palavra-passe.","No se pudo conectar. Inténtalo de nuevo.":"Não foi possível ligar. Tenta outra vez.","Nueva contraseña":"Nova palavra-passe","Guardar contraseña":"Guardar palavra-passe","Contraseña cambiada":"Palavra-passe alterada",
@@ -1251,7 +1339,8 @@ pt:{"Entrar":"Entrar","Crear cuenta":"Criar conta","Correo":"Email","Contraseña
 "Ingresos":"Rendimentos","Lo que entra cada mes. Si cobras en una cuenta y luego pasas una parte a otra, dímelo y la app lo hace sola cada vez.":"O que entra todos os meses. Se recebes numa conta e depois passas uma parte para outra, diz-me e a app faz isso sozinha.","Sueldo mensual":"Salário mensal","No tengo un sueldo fijo":"Não tenho salário fixo","Día de cobro":"Dia do pagamento","¿En qué cuenta entra?":"Em que conta entra?","¿Pasas una parte a otra cuenta?":"Passas uma parte para outra conta?","Pasar a {n}":"Passar para {n}","Pagas extra":"Subsídios","Por ejemplo la de Navidad o la de verano. Si no tienes, déjalo vacío.":"Por exemplo o de Natal ou o de férias. Se não tens, deixa vazio.","Nombre":"Nome","Mes":"Mês","Importe":"Valor","+ Añadir paga extra":"+ Adicionar subsídio","Paga de Navidad":"Subsídio de Natal","Paga de verano":"Subsídio de férias",
 "Gastos fijos":"Despesas fixas","Lo que pagas todos los meses casi igual. Toca los que tengas y pon el importe y el día. Lo que no sepas exacto, ponlo aproximado.":"O que pagas todos os meses quase igual. Toca nos que tens e põe o valor e o dia. Se não souberes exato, põe aproximado.","Día":"Dia","Sale de":"Sai de","Categoría":"Categoria","Otro gasto fijo":"Outra despesa fixa","Escribe el nombre de cada gasto.":"Escreve o nome de cada despesa.",
 "Deudas":"Dívidas","¿Estás pagando algo a plazos o le debes dinero a alguien? La app te avisa de cada cuota y la archiva cuando termines.":"Estás a pagar algo às prestações ou deves dinheiro a alguém? A app avisa-te de cada prestação e arquiva-a quando terminares.","¿Qué es?":"O que é?","Te falta pagar":"Falta pagar","Cuota al mes":"Prestação mensal","+ Añadir deuda":"+ Adicionar dívida","No tengo deudas":"Não tenho dívidas","Completa nombre, lo que falta y la cuota.":"Preenche o nome, o que falta e a prestação.",
-"Objetivos y ahorro":"Objetivos e poupança","Los botes son dinero apartado para algo. Elige los que quieras, pon cuánto tienes ya y cuánto quieres apartar al mes.":"Os mealheiros são dinheiro guardado para algo. Escolhe os que quiseres, quanto já tens e quanto queres guardar por mês.","Fondo de emergencia":"Fundo de emergência","Imprevistos":"Imprevistos","Viajes":"Viagens","Otro objetivo":"Outro objetivo","Ya tengo":"Já tenho","Meta":"Meta","Al mes":"Por mês","Dónde está":"Onde está","Te recomiendo unos {v}: tres meses de tus gastos fijos.":"Recomendo cerca de {v}: três meses das tuas despesas fixas.","Cuando cobres una paga extra, apartar":"Quando receberes um subsídio, guardar","para":"para","Límite al mes para salidas y comer fuera (opcional)":"Limite mensal para saídas e comer fora (opcional)",
+"Objetivos y ahorro":"Objetivos e poupança","Los botes son dinero apartado para algo. Elige los que quieras, pon cuánto tienes ya y cuánto quieres apartar al mes.":"Os mealheiros são dinheiro guardado para algo. Escolhe os que quiseres, quanto já tens e quanto queres guardar por mês.","Fondo de emergencia":"Fundo de emergência","Imprevistos":"Imprevistos","Viajes":"Viagens","Otro objetivo":"Outro objetivo","Ya tengo":"Já tenho","Meta":"Meta","Al mes":"Por mês","Dónde está":"Onde está","Meses de cobertura":"Meses de cobertura","Incluir también la cuota de mis deudas ({v}/mes)":"Incluir também a prestação das minhas dívidas ({v}/mês)","Te recomiendo unos {v}: {m} meses de tus {f} de gastos fijos{d}.":"Recomendo cerca de {v}: {m} meses das tuas {f} de despesas fixas{d}.","de cuotas de deudas":"de prestações de dívidas","No cuenta el capital pendiente de tus deudas, solo lo que pagas al mes.":"Isto não conta o capital em falta das tuas dívidas, só o que pagas por mês.","Cuando cobres una paga extra, apartar":"Quando receberes um subsídio, guardar","para":"para","Límite al mes para salidas y comer fuera (opcional)":"Limite mensal para saídas e comer fora (opcional)",
+"Antes de empezar":"Antes de começar","Esto ya vencía este mes, antes de hoy. Si ya lo pagaste o cobraste, lo dejamos marcado para que no aparezca pendiente ni se descuente dos veces de tu saldo inicial.":"Isto já vencia este mês, antes de hoje. Se já pagaste ou recebeste, deixamos marcado para não aparecer pendente nem ser descontado duas vezes do teu saldo inicial.","Marcar todo como ya pagado":"Marcar tudo como já pago","Marcar todo como pendiente":"Marcar tudo como pendente","Ya pagado":"Já feito","Pendiente":"Pendente","No tienes nada vencido antes de hoy. Puedes seguir.":"Não tens nada vencido antes de hoje. Podes continuar.",
 "Resumen":"Resumo","Así queda tu mes. Puedes cambiar todo después.":"Assim fica o teu mês. Podes mudar tudo depois.","Ingresos al mes":"Rendimentos por mês","Cuotas de deudas":"Prestações de dívidas","Ahorro en botes":"Poupança nos mealheiros","Te queda para el día a día":"Fica-te para o dia a dia","Con tus fijos y ahorros, no te llega. Prueba a bajar lo que apartas en los botes.":"Com as despesas fixas e poupanças, não chega. Experimenta baixar o que guardas nos mealheiros.","Además, en tu tarjeta de comida: {v} al mes.":"Além disso, no cartão refeição: {v} por mês.","Y pagas extra: {v} al año.":"E subsídios: {v} por ano.",
 "Tu cuenta":"A tua conta","Cerrar sesión":"Terminar sessão","Borrar mi cuenta":"Apagar a minha conta","Compartir en solo lectura":"Partilhar só de leitura","Crea un código y mándaselo a quien quieras. Podrá ver tus finanzas, pero no cambiar nada. Un código sirve para una persona.":"Cria um código e envia-o a quem quiseres. Poderá ver as tuas finanças, mas não mudar nada. Um código serve para uma pessoa.","Crear código":"Criar código","Pendiente":"Pendente","En uso":"Em uso","Quitar acceso":"Retirar acesso","¿Te pasaron un código?":"Enviaram-te um código?","Mis finanzas":"As minhas finanças","Finanzas de {n}":"Finanças de {n}","Código no válido o ya usado.":"Código inválido ou já usado.","Ahora puedes ver las finanzas de {n}.":"Agora podes ver as finanças de {n}.","Guardar":"Guardar","Perfil":"Perfil","Copiado":"Copiado","Tus datos":"Os teus dados","Importar datos (JSON)":"Importar dados (JSON)"}};
 const t=(s,v)=>{let r=(LANG!=="es"&&TR[LANG]&&TR[LANG][s])||s;if(v)for(const k in v)r=r.split("{"+k+"}").join(v[k]);return r};
@@ -1339,19 +1428,33 @@ document.addEventListener("visibilitychange",()=>{if(!document.hidden&&ME&&TARGE
 
 /* ---------- asistente de bienvenida ---------- */
 const W={step:0};
-const n2=v=>{const x=parseFloat(String(v==null?"":v).replace(/\s/g,"").replace(",","."));return isFinite(x)?Math.round(x*100)/100:0};
+/* Admite "1.234,56", "1234.56", "1,234.56"… el último separador siempre es el decimal. NaN si no hay número. */
+function toNum(v){v=String(v==null?"":v).trim();if(!v)return NaN;
+  let neg=false;if(v[0]==="-"){neg=true;v=v.slice(1)}else if(v[0]==="+")v=v.slice(1);
+  v=v.replace(/[^0-9,.]/g,"");const parts=v.split(/[,.]/);
+  const out=parts.length>1?parts.slice(0,-1).join("")+"."+parts[parts.length-1]:parts[0]||"";
+  const n=parseFloat(out);return isFinite(n)?(neg?-n:n):NaN}
+const n2=v=>{const x=toNum(v);return isFinite(x)?Math.round(x*100)/100:0};
 const fv=v=>v===0||v?String(v).replace(".",","):"";
 function wInit(){Object.assign(W,{step:0,nombre:"",moneda:"€",cuentas:[{nombre:t("Banco principal"),saldo:""}],gasto:0,
   cf:{on:false,nombre:"",saldo:"",recarga:"",dia:1},sal:{on:true,importe:"",dia:1,cuenta:0,rep:{}},pagas:[],
   fijos:[],deudas:[],noDeudas:false,botes:[{k:"emergencia",on:true,saldo:"",meta:"",mensual:"",cuenta:0},{k:"imprevistos",on:false,saldo:"",meta:"600",mensual:"",cuenta:0},{k:"viajes",on:false,saldo:"",meta:"",mensual:"",cuenta:0}],
+  emMeses:3,emDeudas:false,emMetaTouched:false,revPendIds:[],
   regla:{pct:50,bote:"viajes"},limite:""})}
-const STEPS=["tu","cuentas","cf","ingresos","fijos","deudas","botes","resumen"];
+const STEPS=["tu","cuentas","cf","ingresos","fijos","deudas","botes","revision","resumen"];
+/* lo que ya tocaba pagar o cobrar este mes, antes de hoy — para la pantalla de revisión del asistente */
+function reviewDue(){const m0=mk(now),{cfg}=wBuild(),out=[];
+  (cfg.programados||[]).forEach(p=>{if(p.meses&&p.meses.length&&!p.meses.includes(+m0.slice(5)))return;
+    const f=dueOf(p,m0);if(f<=todayStr)out.push({id:p.id,nombre:p.nombre,tipo:p.tipo,importe:p.importe,fecha:f})});
+  (cfg.botes||[]).forEach(b=>{const v=planEn(b.plan,m0);if(v>0){const f=dueOf({dia:1},m0);if(f<=todayStr)out.push({id:"bote-"+b.id,nombre:b.nombre.startsWith("Ahorro")?b.nombre:"Ahorro · "+b.nombre,tipo:"aporte",importe:v,fecha:f})}});
+  return out.sort((a,b)=>a.fecha.localeCompare(b.fecha))}
 function wizard(){if(W.step===undefined||!W.cuentas)wInit();gate.redraw=wDraw;wDraw()}
 function accOpts(sel){return W.cuentas.map((c,i)=>`<option value="${i}"${+sel===i?" selected":""}>${esc(c.nombre||"—")}</option>`).join("")}
 const fixedSum=()=>W.fijos.reduce((s,f)=>s+n2(f.importe),0);
 const debtSum=()=>W.deudas.reduce((s,d)=>s+n2(d.cuota),0);
 const boteName=b=>b.k==="emergencia"?t("Fondo de emergencia"):b.k==="imprevistos"?t("Imprevistos"):b.k==="viajes"?t("Viajes"):(b.nombre||t("Otro objetivo"));
 const boteIc={emergencia:["shield","#22A06B"],imprevistos:["medical_services","#E39B1A"],viajes:["flight","#0891B2"]};
+function emHint(sug2,meses,fx,dd){return`${t("Te recomiendo unos {v}: {m} meses de tus {f} de gastos fijos{d}.",{v:eur0(sug2),m:meses,f:eur0(fx),d:W.emDeudas&&dd?" + "+eur0(dd)+" "+t("de cuotas de deudas"):""})} ${t("No cuenta el capital pendiente de tus deudas, solo lo que pagas al mes.")}`}
 function wDraw(){const k=STEPS[W.step],tot=STEPS.length;let h="";const mon=MESES[LANG]||MESES.es;
   const head=(ic,title,hint)=>`<div class="wic"><span class="ms">${ic}</span></div><h2 class="wt">${title}</h2><p class="whint">${hint}</p>`;
   if(k==="tu"){h=head("waving_hand",t("Bienvenido a La Plata"),t("Te haré unas preguntas para dejar la app lista para ti. Son unos 5 minutos y todo se puede cambiar después en Ajustes."))+
@@ -1361,7 +1464,7 @@ function wDraw(){const k=STEPS[W.step],tot=STEPS.length;let h="";const mon=MESES
      <div class="walt"><b>${t("¿Solo quieres ver las finanzas de alguien?")}</b><p class="whint" style="margin:2px 0 8px">${t("Si te pasaron un código de invitación, ponlo aquí y no tienes que rellenar nada.")}</p><div style="display:flex;gap:8px"><input id="wCode" placeholder="${t("Código")}" style="text-transform:uppercase"><button class="btn" id="wCodeB">${t("Ver")}</button></div><div class="err" id="wCodeE"></div></div>
      <div class="walt"><b>${t("¿Ya usabas La Plata con Google Sheets?")}</b><div style="margin-top:8px"><button class="btn" id="wImp"><span class="ms">upload_file</span>${t("Importar mis datos")}</button></div></div>`}
   else if(k==="cuentas"){h=head("account_balance",t("Tus cuentas"),t("¿Dónde tienes tu dinero? Pon cada cuenta y cuánto tiene hoy. No cuentes lo que tienes apartado como ahorro: eso va en los botes, más adelante."))+
-    W.cuentas.map((c,i)=>`<div class="wrow"><div><label class="f">${t("Nombre de la cuenta")}</label><input data-wa="cuentas.${i}.nombre" value="${esc(c.nombre)}"></div><div><label class="f">${t("Saldo hoy")} (${esc(W.moneda)})</label><input class="num" inputmode="decimal" data-wa="cuentas.${i}.saldo" value="${esc(c.saldo)}" placeholder="0"></div>${W.cuentas.length>1?`<button class="ib" data-del="cuentas.${i}" aria-label="Quitar"><span class="ms">close</span></button>`:"<span></span>"}</div>`).join("")+
+    W.cuentas.map((c,i)=>`<div class="wrow"><div><label class="f">${t("Nombre de la cuenta")}</label><input data-wa="cuentas.${i}.nombre" value="${esc(c.nombre)}"></div><div><label class="f">${t("Saldo hoy")} (${esc(W.moneda)})</label><input class="num" inputmode="decimal" data-signed="1" data-wa="cuentas.${i}.saldo" value="${esc(c.saldo)}" placeholder="0"></div>${W.cuentas.length>1?`<button class="ib" data-del="cuentas.${i}" aria-label="Quitar"><span class="ms">close</span></button>`:"<span></span>"}</div>`).join("")+
     `<div class="opts" style="margin:6px 0 14px"><button class="opt" data-addacc="">${t("+ Añadir otra cuenta")}</button>${["Revolut","PayPal",t("Efectivo")].filter(n=>!W.cuentas.some(c=>c.nombre===n)).map(n=>`<button class="opt" data-addacc="${esc(n)}">+ ${esc(n)}</button>`).join("")}</div>
      ${W.cuentas.length>1?`<label class="f" for="wG">${t("¿Con cuál pagas normalmente el día a día?")}</label><select id="wG" data-w="gasto">${accOpts(W.gasto)}</select>`:""}`}
   else if(k==="cf"){h=head("restaurant",t("Tarjeta de comida"),t("¿Tienes una tarjeta de comida o vales de la empresa (CoverFlex, Edenred, Pluxee…)? La app la lleva aparte, porque ese dinero solo sirve para comida."))+
@@ -1386,14 +1489,21 @@ function wDraw(){const k=STEPS[W.step],tot=STEPS.length;let h="";const mon=MESES
     W.deudas.map((d,i)=>`<div class="wfix"><div class="wfixh"><span class="ms">credit_card</span><input data-wa="deudas.${i}.nombre" value="${esc(d.nombre)}" placeholder="${t("¿Qué es?")}"><button class="ib" data-del="deudas.${i}" aria-label="Quitar"><span class="ms">close</span></button></div>
       <div class="wgrid3 w4"><div><label class="f">${t("Te falta pagar")}</label><input class="num" inputmode="decimal" data-wa="deudas.${i}.falta" value="${esc(d.falta)}" placeholder="0"></div><div><label class="f">${t("Cuota al mes")}</label><input class="num" inputmode="decimal" data-wa="deudas.${i}.cuota" value="${esc(d.cuota)}" placeholder="0"></div><div><label class="f">${t("Día")}</label><input class="num" inputmode="numeric" data-wa="deudas.${i}.dia" value="${esc(d.dia)}"></div><div><label class="f">${t("Sale de")}</label><select data-wa="deudas.${i}.cuenta">${accOpts(d.cuenta)}</select></div></div></div>`).join("")+
     `<div class="opts"><button class="opt" id="wAddD">${t("+ Añadir deuda")}</button></div>`}
-  else if(k==="botes"){const sug=Math.ceil((fixedSum()+debtSum())*3/50)*50;
+  else if(k==="botes"){const meses=Math.min(12,Math.max(1,parseInt(W.emMeses,10)||3)),fx=fixedSum(),dd=debtSum();
+    const sug=Math.ceil(fx*meses/50)*50,sugDd=Math.ceil((fx+dd)*meses/50)*50,sug2=W.emDeudas&&dd?sugDd:sug;
     h=head("savings",t("Objetivos y ahorro"),t("Los botes son dinero apartado para algo. Elige los que quieras, pon cuánto tienes ya y cuánto quieres apartar al mes."))+
     W.botes.map((b,i)=>{const ic=boteIc[b.k]||["flag","#8B5CF6"];return`<div class="wfix${b.on?"":" off"}"><div class="wfixh"><input type="checkbox" data-bon="${i}"${b.on?" checked":""} aria-label="Usar"><span class="ms" style="color:${ic[1]}">${ic[0]}</span>${b.k==="otro"?`<input data-wa="botes.${i}.nombre" value="${esc(b.nombre||"")}" placeholder="${t("Otro objetivo")}">`:`<b>${esc(boteName(b))}</b>`}${b.k==="otro"?`<button class="ib" data-del="botes.${i}" aria-label="Quitar"><span class="ms">close</span></button>`:""}</div>
-      ${b.on?`<div class="wgrid3 w4"><div><label class="f">${t("Ya tengo")}</label><input class="num" inputmode="decimal" data-wa="botes.${i}.saldo" value="${esc(b.saldo)}" placeholder="0"></div><div><label class="f">${t("Meta")}</label><input class="num" inputmode="decimal" data-wa="botes.${i}.meta" value="${esc(b.meta||(b.k==="emergencia"&&sug?sug:""))}" placeholder="0"></div><div><label class="f">${t("Al mes")}</label><input class="num" inputmode="decimal" data-wa="botes.${i}.mensual" value="${esc(b.mensual)}" placeholder="0"></div><div><label class="f">${t("Dónde está")}</label><select data-wa="botes.${i}.cuenta">${accOpts(b.cuenta)}</select></div></div>
-      ${b.k==="emergencia"&&sug?`<p class="whint" style="margin:8px 0 0">${t("Te recomiendo unos {v}: tres meses de tus gastos fijos.",{v:eur0(sug)})}</p>`:""}`:""}</div>`}).join("")+
+      ${b.on&&b.k==="emergencia"?`<div class="wgrid3" style="margin-bottom:10px"><div><label class="f">${t("Meses de cobertura")}</label><input class="num" inputmode="numeric" id="wEmMeses" data-wa="emMeses" value="${esc(meses)}" style="max-width:100px"></div>${dd?`<div style="grid-column:span 2;align-self:end"><div class="chk"><input type="checkbox" id="wEmDeudas"${W.emDeudas?" checked":""}><label for="wEmDeudas">${t("Incluir también la cuota de mis deudas ({v}/mes)",{v:eur0(dd)})}</label></div></div>`:""}</div>`:""}
+      ${b.on?`<div class="wgrid3 w4"><div><label class="f">${t("Ya tengo")}</label><input class="num" inputmode="decimal" data-wa="botes.${i}.saldo" value="${esc(b.saldo)}" placeholder="0"></div><div><label class="f">${t("Meta")}</label><input class="num" inputmode="decimal" data-wa="botes.${i}.meta"${b.k==="emergencia"?' id="wEmMeta"':""} value="${esc(b.meta||(b.k==="emergencia"&&sug2?sug2:""))}" placeholder="0"></div><div><label class="f">${t("Al mes")}</label><input class="num" inputmode="decimal" data-wa="botes.${i}.mensual" value="${esc(b.mensual)}" placeholder="0"></div><div><label class="f">${t("Dónde está")}</label><select data-wa="botes.${i}.cuenta">${accOpts(b.cuenta)}</select></div></div>
+      ${b.k==="emergencia"&&sug2?`<p class="whint" id="emHint" style="margin:8px 0 0">${emHint(sug2,meses,fx,dd)}</p>`:""}`:""}</div>`}).join("")+
     `<div class="opts" style="margin-bottom:14px"><button class="opt" id="wAddB">+ ${t("Otro objetivo")}</button></div>
      ${W.pagas.length&&W.botes.some(b=>b.on)?`<div class="walt" style="margin-top:0"><label class="f">${t("Cuando cobres una paga extra, apartar")}</label><div style="display:flex;gap:8px;align-items:center"><input class="num" inputmode="numeric" data-wa="regla.pct" value="${esc(W.regla.pct)}" style="width:80px"> % ${t("para")} <select data-wa="regla.bote"><option value="">—</option>${W.botes.map((b,i)=>b.on?`<option value="${i}"${String(W.regla.bote)===String(i)||(W.regla.bote==="viajes"&&b.k==="viajes")?" selected":""}>${esc(boteName(b))}</option>`:"").join("")}</select></div></div>`:""}
      <label class="f" style="margin-top:12px">${t("Límite al mes para salidas y comer fuera (opcional)")}</label><input class="num" inputmode="decimal" data-wa="limite" value="${esc(W.limite)}" placeholder="—" style="max-width:200px">`}
+  else if(k==="revision"){const due=reviewDue();
+    h=head("fact_check",t("Antes de empezar"),t("Esto ya vencía este mes, antes de hoy. Si ya lo pagaste o cobraste, lo dejamos marcado para que no aparezca pendiente ni se descuente dos veces de tu saldo inicial."))+
+    (due.length?`<div class="opts" style="margin-bottom:12px"><button class="opt" id="wRevAllPaid">${t("Marcar todo como ya pagado")}</button><button class="opt" id="wRevAllPend">${t("Marcar todo como pendiente")}</button></div>`+
+      due.map(d=>{const pend=W.revPendIds.includes(d.id),pos=d.tipo==="ingreso";return`<div class="wfix" style="display:flex;align-items:center;gap:10px"><span class="ms" style="color:var(--muted)">${pos?"trending_up":d.tipo==="aporte"?"savings":"shopping_bag"}</span><div style="flex:1;min-width:0"><b>${esc(d.nombre)}</b><div class="whint" style="margin:0">${+d.fecha.slice(8)} ${mon[+d.fecha.slice(5,7)-1]} · ${pos?"+":"−"} ${eur(d.importe)}</div></div><div class="seg"><button type="button" class="${pend?"":"on"}" data-revpaid="${esc(d.id)}">${t("Ya pagado")}</button><button type="button" class="${pend?"on":""}" data-revpend="${esc(d.id)}">${t("Pendiente")}</button></div></div>`}).join(""):
+      `<p class="whint">${t("No tienes nada vencido antes de hoy. Puedes seguir.")}</p>`)}
   else if(k==="resumen"){const inc=W.sal.on?n2(W.sal.importe):0,fx=fixedSum(),dd=debtSum(),ah=W.botes.filter(b=>b.on).reduce((s,b)=>s+n2(b.mensual),0),lib=inc-fx-dd-ah,pg=W.pagas.reduce((s,p)=>s+n2(p.importe),0);
     h=head("task_alt",t("Resumen"),t("Así queda tu mes. Puedes cambiar todo después."))+
     `<div class="wsum"><div><span>${t("Ingresos al mes")}</span><b class="num pos">${eur(inc)}</b></div><div><span>${t("Gastos fijos")}</span><b class="num">− ${eur(fx)}</b></div>${dd?`<div><span>${t("Cuotas de deudas")}</span><b class="num">− ${eur(dd)}</b></div>`:""}${ah?`<div><span>${t("Ahorro en botes")}</span><b class="num">− ${eur(ah)}</b></div>`:""}
@@ -1422,6 +1532,19 @@ function wBind(){const G=$("#gate");
   if($("#wAddD"))$("#wAddD").onclick=()=>{wKeep();W.deudas.push({nombre:"",falta:"",cuota:"",dia:1,cuenta:0});wDraw()};
   if($("#wAddB"))$("#wAddB").onclick=()=>{wKeep();W.botes.push({k:"otro",on:true,nombre:"",saldo:"",meta:"",mensual:"",cuenta:0});wDraw()};
   G.querySelectorAll("[data-bon]").forEach(c=>c.onchange=()=>{wKeep();W.botes[+c.dataset.bon].on=c.checked;wDraw()});
+  G.querySelectorAll("[data-revpend]").forEach(b=>b.onclick=()=>{wKeep();if(!W.revPendIds.includes(b.dataset.revpend))W.revPendIds.push(b.dataset.revpend);wDraw()});
+  G.querySelectorAll("[data-revpaid]").forEach(b=>b.onclick=()=>{wKeep();W.revPendIds=W.revPendIds.filter(x=>x!==b.dataset.revpaid);wDraw()});
+  if($("#wRevAllPaid"))$("#wRevAllPaid").onclick=()=>{wKeep();W.revPendIds=[];wDraw()};
+  if($("#wRevAllPend"))$("#wRevAllPend").onclick=()=>{wKeep();W.revPendIds=reviewDue().map(d=>d.id);wDraw()};
+  if($("#wEmMeta"))$("#wEmMeta").addEventListener("input",()=>{W.emMetaTouched=true});
+  if($("#wEmMeses")||$("#wEmDeudas")){
+    const recalcEm=()=>{const fx=fixedSum(),dd=debtSum(),meses=Math.min(12,Math.max(1,parseInt($("#wEmMeses")?.value,10)||3));
+      const sug=Math.ceil(fx*meses/50)*50,sugDd=Math.ceil((fx+dd)*meses/50)*50,sug2=W.emDeudas&&dd?sugDd:sug;
+      if($("#wEmMeta")&&!W.emMetaTouched)$("#wEmMeta").value=fv(sug2);
+      if($("#emHint"))$("#emHint").innerHTML=emHint(sug2,meses,fx,dd)};
+    if($("#wEmMeses"))$("#wEmMeses").addEventListener("input",recalcEm);
+    if($("#wEmDeudas"))$("#wEmDeudas").onchange=()=>{W.emDeudas=$("#wEmDeudas").checked;recalcEm()};
+  }
   G.querySelectorAll("[data-wa$='.importe'],[data-wa$='.cuota']").forEach(i=>i.addEventListener("input",()=>{if(STEPS[W.step]==="fijos"){wKeep();const el=G.querySelector(".wtot b");if(el)el.textContent=eur(fixedSum())}}));
   if($("#wBack"))$("#wBack").onclick=()=>{wKeep();W.step--;wDraw()};
   if($("#wSkip"))$("#wSkip").onclick=()=>{wKeep();W.step++;wDraw()};
@@ -1453,6 +1576,11 @@ function wBuild(){const m0=mk(now),L=LANG,I=INC_DEF[L]||INC_DEF.es,cols=["#3B7BF
     programados.push({id:"p-"+id,nombre:d.nombre.trim(),tipo:"pago",deuda:id,importe:q,dia:Math.min(31,Math.max(1,+d.dia||1)),desde:m0,hasta:addM(m0,n-1),cuenta:acc(d.cuenta)})});
   const botes=[];const bIdx={};W.botes.forEach((b,i)=>{if(!b.on)return;const nm=boteName(b).trim();if(!nm)return;const ic=boteIc[b.k]||["flag",PALETTE[(i+4)%PALETTE.length]];const id=b.k!=="otro"?b.k:uid("b-"+nm);bIdx[i]=id;
     botes.push({id,nombre:nm,icon:ic[0],color:ic[1],meta:n2(b.meta)||0,inicial:n2(b.saldo),plan:n2(b.mensual)?[{desde:m0,mensual:n2(b.mensual)}]:[],cuenta:acc(b.cuenta)})});
+  /* lo que ya vencía antes de hoy queda marcado "pagado antes", salvo que el usuario diga que sigue pendiente */
+  const revPend=new Set(W.revPendIds||[]);
+  programados.forEach(p=>{if(p.meses&&p.meses.length&&!p.meses.includes(+m0.slice(5)))return;
+    if(dueOf(p,m0)<=todayStr&&!revPend.has(p.id))p.over={[m0]:"pagado_antes"}});
+  botes.forEach(b=>{if(planEn(b.plan,m0)>0&&dueOf({dia:1},m0)<=todayStr&&!revPend.has("bote-"+b.id))b.over={[m0]:"pagado_antes"}});
   const rb=W.regla.bote==="viajes"?Object.keys(bIdx).find(i=>W.botes[i].k==="viajes"):W.regla.bote;
   const cfg={nombre:W.nombre.trim(),lang:LANG,moneda:W.moneda,inicio:m0,cuentas,cuentaGasto:acc(W.gasto),catsGasto,catsIngreso,programados,deudas,botes,debo:[],
     tarjeta:{on:!!W.cf.on,nombre:cfName},limites:n2(W.limite)?{social:n2(W.limite)}:{},reparto:{},creado:new Date().toISOString()};
